@@ -12,6 +12,7 @@ import arrow
 import sqlalchemy
 
 from app import config
+from app.constants import JobType
 from app.db import Session
 from app.email import headers
 from app.email_utils import (
@@ -137,7 +138,9 @@ class ExportUserDataJob:
         msg[headers.SUBJECT] = "Your SimpleLogin data"
         msg[headers.FROM] = f'"SimpleLogin (noreply)" <{config.NOREPLY}>'
         msg[headers.TO] = to_email
-        msg.attach(MIMEText(render("transactional/user-report.html"), "html"))
+        msg.attach(
+            MIMEText(render("transactional/user-report.html", user=self._user), "html")
+        )
         attachment = MIMEApplication(zipped_contents.read())
         attachment.add_header(
             "Content-Disposition", "attachment", filename="user_report.zip"
@@ -172,7 +175,7 @@ class ExportUserDataJob:
         jobs_in_db = (
             Session.query(Job)
             .filter(
-                Job.name == config.JOB_SEND_USER_REPORT,
+                Job.name == JobType.SEND_USER_REPORT.value,
                 Job.payload.op("->")("user_id").cast(sqlalchemy.TEXT)
                 == str(self._user.id),
                 Job.taken.is_(False),
@@ -182,7 +185,7 @@ class ExportUserDataJob:
         if jobs_in_db > 0:
             return None
         return Job.create(
-            name=config.JOB_SEND_USER_REPORT,
+            name=JobType.SEND_USER_REPORT.value,
             payload={"user_id": self._user.id},
             run_at=arrow.now(),
             commit=True,

@@ -6,7 +6,7 @@ from app.db import Session
 from app.log import LOG
 from app.models import Mailbox, Contact, SLDomain, Partner
 from app.pgp_utils import load_public_key
-from app.proton.utils import PROTON_PARTNER_NAME
+from app.proton.proton_partner import PROTON_PARTNER_NAME
 from server import create_light_app
 
 
@@ -56,14 +56,15 @@ def add_sl_domains():
     Session.commit()
 
 
-def add_proton_partner():
+def add_proton_partner() -> Partner:
     proton_partner = Partner.get_by(name=PROTON_PARTNER_NAME)
     if not proton_partner:
-        Partner.create(
+        proton_partner = Partner.create(
             name=PROTON_PARTNER_NAME,
             contact_email="simplelogin@protonmail.com",
         )
         Session.commit()
+    return proton_partner
 
 
 if __name__ == "__main__":

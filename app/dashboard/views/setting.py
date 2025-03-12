@@ -14,7 +14,7 @@ from flask_wtf import FlaskForm
 from flask_wtf.file import FileField
 from wtforms import StringField, validators
 
-from app import s3
+from app import s3, user_settings
 from app.config import (
     FIRST_ALIAS_DOMAIN,
     ALIAS_RANDOM_SUFFIX_LENGTH,
@@ -31,19 +31,18 @@ from app.models import (
     PlanEnum,
     File,
     EmailChange,
-    CustomDomain,
     AliasGeneratorEnum,
     AliasSuffixEnum,
     ManualSubscription,
     SenderFormatEnum,
-    SLDomain,
     CoinbaseSubscription,
     AppleSubscription,
     PartnerUser,
     PartnerSubscription,
     UnsubscribeBehaviourEnum,
 )
-from app.proton.utils import get_proton_partner
+from app.proton.proton_partner import get_proton_partner
+from app.proton.proton_unlink import can_unlink_proton_account
 from app.utils import (
     random_string,
     CSRFValidationForm,
@@ -166,44 +165,22 @@ def setting():
             return redirect(url_for("dashboard.setting"))
         elif request.form.get("form-name") == "change-random-alias-default-domain":
             default_domain = request.form.get("random-alias-default-domain")
-
-            if default_domain:
-                sl_domain: SLDomain = SLDomain.get_by(domain=default_domain)
-                if sl_domain:
-                    if sl_domain.premium_only and not current_user.is_premium():
-                        flash("You cannot use this domain", "error")
-                        return redirect(url_for("dashboard.setting"))
-
-                    current_user.default_alias_public_domain_id = sl_domain.id
-                    current_user.default_alias_custom_domain_id = None
-                else:
-                    custom_domain = CustomDomain.get_by(domain=default_domain)
-                    if custom_domain:
-                        # sanity check
-                        if (
-                            custom_domain.user_id != current_user.id
-                            or not custom_domain.verified
-                        ):
-                            LOG.w(
-                                "%s cannot use domain %s", current_user, custom_domain
-                            )
-                            flash(f"Domain {default_domain} can't be used", "error")
-                            return redirect(request.url)
-                        else:
-                            current_user.default_alias_custom_domain_id = (
-                                custom_domain.id
-                            )
-                            current_user.default_alias_public_domain_id = None
-
-            else:
-                current_user.default_alias_custom_domain_id = None
-                current_user.default_alias_public_domain_id = None
+            try:
+                user_settings.set_default_alias_domain(current_user, default_domain)
+            except user_settings.CannotSetAlias as e:
+                flash(e.msg, "error")
+                return redirect(url_for("dashboard.setting"))
 
             Session.commit()
             flash("Your preference has been updated", "success")
             return redirect(url_for("dashboard.setting"))
         elif request.form.get("form-name") == "random-alias-suffix":
-            scheme = int(request.form.get("random-alias-suffix-generator"))
+            try:
+                scheme = int(request.form.get("random-alias-suffix-generator"))
+            except ValueError:
+                flash("Invalid value", "error")
+                return redirect(url_for("dashboard.setting"))
+
             if AliasSuffixEnum.has_value(scheme):
                 current_user.random_alias_suffix = scheme
                 Session.commit()
@@ -347,4 +324,5 @@ def setting():
         ALIAS_RAND_SUFFIX_LENGTH=ALIAS_RANDOM_SUFFIX_LENGTH,
         connect_with_proton=CONNECT_WITH_PROTON,
         proton_linked_account=proton_linked_account,
+        can_unlink_proton_account=can_unlink_proton_account(current_user),
     )

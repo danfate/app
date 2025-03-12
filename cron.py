@@ -14,8 +14,9 @@ from sqlalchemy.sql import Insert, text
 from app import s3, config
 from app.alias_utils import nb_email_log_for_mailbox
 from app.api.views.apple import verify_receipt
+from app.custom_domain_validation import CustomDomainValidation, is_mx_equivalent
 from app.db import Session
-from app.dns_utils import get_mx_domains, is_mx_equivalent
+from app.dns_utils import get_mx_domains
 from app.email_utils import (
     send_email,
     send_trial_end_soon_email,
@@ -58,9 +59,12 @@ from app.models import (
     ApiToCookieToken,
 )
 from app.pgp_utils import load_public_key_and_check, PGPException
-from app.proton.utils import get_proton_partner
+from app.proton.proton_partner import get_proton_partner
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 from app.utils import sanitize_email
 from server import create_light_app
+from tasks.clean_alias_audit_log import cleanup_alias_audit_log
+from tasks.clean_user_audit_log import cleanup_user_audit_log
 from tasks.cleanup_old_imports import cleanup_old_imports
 from tasks.cleanup_old_jobs import cleanup_old_jobs
 from tasks.cleanup_old_notifications import cleanup_old_notifications
@@ -266,11 +270,13 @@ def notify_manual_sub_end():
                 "Your SimpleLogin subscription will end soon",
                 render(
                     "transactional/coinbase/reminder-subscription.txt",
+                    user=user,
                     coinbase_subscription=coinbase_subscription,
                     extend_subscription_url=extend_subscription_url,
                 ),
                 render(
                     "transactional/coinbase/reminder-subscription.html",
+                    user=user,
                     coinbase_subscription=coinbase_subscription,
                     extend_subscription_url=extend_subscription_url,
                 ),
@@ -280,8 +286,16 @@ def notify_manual_sub_end():
 
 def poll_apple_subscription():
     """Poll Apple API to update AppleSubscription"""
-    # todo: only near the end of the subscription
-    for apple_sub in AppleSubscription.all():
+    for apple_sub in (
+        AppleSubscription.filter(
+            AppleSubscription.expires_date < arrow.now().shift(days=15)
+        )
+        .enable_eagerloads(False)
+        .yield_per(100)
+    ):
+        if not apple_sub.is_valid():
+            # Subscription is not valid anymore and hasn't been renewed
+            continue
         if not apple_sub.product_id:
             LOG.d("Ignore %s", apple_sub)
             continue
@@ -826,10 +840,12 @@ def check_mailbox_valid_domain():
                         f"Mailbox {mailbox.email} is disabled",
                         render(
                             "transactional/disable-mailbox-warning.txt.jinja2",
+                            user=mailbox.user,
                             mailbox=mailbox,
                         ),
                         render(
                             "transactional/disable-mailbox-warning.html",
+                            user=mailbox.user,
                             mailbox=mailbox,
                         ),
                         retries=3,
@@ -884,6 +900,7 @@ def check_mailbox_valid_pgp_keys():
                 f"Mailbox {mailbox.email}'s PGP Key is invalid",
                 render(
                     "transactional/invalid-mailbox-pgp-key.txt.jinja2",
+                    user=mailbox.user,
                     mailbox=mailbox,
                 ),
                 retries=3,
@@ -891,6 +908,24 @@ def check_mailbox_valid_pgp_keys():
 
 
 def check_custom_domain():
+    # Delete custom domains that haven't been verified in a month
+    for custom_domain in (
+        CustomDomain.filter(
+            CustomDomain.verified == False,  # noqa: E712
+            CustomDomain.created_at < arrow.now().shift(months=-1),
+        )
+        .enable_eagerloads(False)
+        .yield_per(100)
+    ):
+        alias_count = Alias.filter(Alias.custom_domain_id == custom_domain.id).count()
+        if alias_count > 0:
+            LOG.warn(
+                f"Custom Domain {custom_domain} has {alias_count} aliases. Won't delete"
+            )
+        else:
+            LOG.i(f"Deleting unverified old custom domain {custom_domain}")
+            CustomDomain.delete(custom_domain.id)
+
     LOG.d("Check verified domain for DNS issues")
 
     for custom_domain in CustomDomain.filter_by(verified=True):  # type: CustomDomain
@@ -900,9 +935,11 @@ def check_custom_domain():
             LOG.i("custom domain has been deleted")
 
 
-def check_single_custom_domain(custom_domain):
+def check_single_custom_domain(custom_domain: CustomDomain):
     mx_domains = get_mx_domains(custom_domain.domain)
-    if not is_mx_equivalent(mx_domains, config.EMAIL_SERVERS_WITH_PRIORITY):
+    validator = CustomDomainValidation(dkim_domain=config.EMAIL_DOMAIN)
+    expected_custom_domains = validator.get_expected_mx_records(custom_domain)
+    if not is_mx_equivalent(mx_domains, expected_custom_domains):
         user = custom_domain.user
         LOG.w(
             "The MX record is not correctly set for %s %s %s",
@@ -924,6 +961,7 @@ def check_single_custom_domain(custom_domain):
                 f"Please update {custom_domain.domain} DNS on SimpleLogin",
                 render(
                     "transactional/custom-domain-dns-issue.txt.jinja2",
+                    user=user,
                     custom_domain=custom_domain,
                     domain_dns_url=domain_dns_url,
                 ),
@@ -959,7 +997,7 @@ def delete_expired_tokens():
     LOG.d("Delete api to cookie tokens older than %s, nb row %s", max_time, nb_row)
 
 
-async def _hibp_check(api_key, queue):
+async def _hibp_check(api_key: str, queue: asyncio.Queue):
     """
     Uses a single API key to check the queue as fast as possible.
 
@@ -978,8 +1016,13 @@ async def _hibp_check(api_key, queue):
         if not alias:
             continue
         user = alias.user
-        if user.disabled or not user.is_paid():
+        if user.disabled or not user.is_premium():
             # Mark it as hibp done to skip it as if it had been checked
+            alias.hibp_last_check = arrow.utcnow()
+            Session.commit()
+            continue
+        if alias.flags & Alias.FLAG_PARTNER_CREATED > 0:
+            # Mark as hibp done
             alias.hibp_last_check = arrow.utcnow()
             Session.commit()
             continue
@@ -1209,7 +1252,7 @@ def notify_hibp():
 
 
 def clear_users_scheduled_to_be_deleted(dry_run=False):
-    users = User.filter(
+    users: List[User] = User.filter(
         and_(
             User.delete_on.isnot(None),
             User.delete_on <= arrow.now().shift(days=-DELETE_GRACE_DAYS),
@@ -1221,6 +1264,11 @@ def clear_users_scheduled_to_be_deleted(dry_run=False):
         )
         if dry_run:
             continue
+        emit_user_audit_log(
+            user=user,
+            action=UserAuditLogAction.DeleteUser,
+            message=f"Delete user {user.id} ({user.email})",
+        )
         User.delete(user.id)
         Session.commit()
 
@@ -1232,6 +1280,16 @@ def delete_old_data():
     cleanup_old_notifications(oldest_valid)
 
 
+def clear_alias_audit_log():
+    oldest_valid = arrow.now().shift(days=-config.AUDIT_LOG_MAX_DAYS)
+    cleanup_alias_audit_log(oldest_valid)
+
+
+def clear_user_audit_log():
+    oldest_valid = arrow.now().shift(days=-config.AUDIT_LOG_MAX_DAYS)
+    cleanup_user_audit_log(oldest_valid)
+
+
 if __name__ == "__main__":
     LOG.d("Start running cronjob")
     parser = argparse.ArgumentParser()
@@ -1240,22 +1298,6 @@ if __name__ == "__main__":
         "--job",
         help="Choose a cron job to run",
         type=str,
-        choices=[
-            "stats",
-            "notify_trial_end",
-            "notify_manual_subscription_end",
-            "notify_premium_end",
-            "delete_logs",
-            "delete_old_data",
-            "poll_apple_subscription",
-            "sanity_check",
-            "delete_old_monitoring",
-            "check_custom_domain",
-            "check_hibp",
-            "notify_hibp",
-            "cleanup_tokens",
-            "send_undelivered_mails",
-        ],
     )
     args = parser.parse_args()
     # wrap in an app context to benefit from app setup like database cleanup, sentry integration, etc
@@ -1304,4 +1346,10 @@ if __name__ == "__main__":
             load_unsent_mails_from_fs_and_resend()
         elif args.job == "delete_scheduled_users":
             LOG.d("Deleting users scheduled to be deleted")
-            clear_users_scheduled_to_be_deleted(dry_run=True)
+            clear_users_scheduled_to_be_deleted()
+        elif args.job == "clear_alias_audit_log":
+            LOG.d("Clearing alias audit log")
+            clear_alias_audit_log()
+        elif args.job == "clear_user_audit_log":
+            LOG.d("Clearing user audit log")
+            clear_user_audit_log()

@@ -511,6 +511,19 @@ def test_create_contact_route_invalid_alias(flask_client):
     assert r.status_code == 403
 
 
+def test_create_contact_route_non_existing_alias(flask_client):
+    user, api_key = get_new_user_and_api_key()
+    Session.commit()
+
+    r = flask_client.post(
+        url_for("api.create_contact_route", alias_id=99999999),
+        headers={"Authentication": api_key.code},
+        json={"contact": "First Last <first@example.com>"},
+    )
+
+    assert r.status_code == 403
+
+
 def test_create_contact_route_free_users(flask_client):
     user, api_key = get_new_user_and_api_key()
 
@@ -536,7 +549,7 @@ def test_create_contact_route_free_users(flask_client):
     assert r.status_code == 201
 
     # End trial and disallow for new free users. Config should allow it
-    user.flags = User.FLAG_FREE_DISABLE_CREATE_ALIAS
+    user.flags = User.FLAG_FREE_DISABLE_CREATE_CONTACTS
     Session.commit()
     r = flask_client.post(
         url_for("api.create_contact_route", alias_id=alias.id),
@@ -634,8 +647,8 @@ def test_get_alias(flask_client):
 
 
 def test_is_reverse_alias(flask_client):
-    assert is_reverse_alias("ra+abcd@sl.local")
-    assert is_reverse_alias("reply+abcd@sl.local")
+    assert is_reverse_alias("ra+abcd@sl.lan")
+    assert is_reverse_alias("reply+abcd@sl.lan")
 
     assert not is_reverse_alias("ra+abcd@test.org")
     assert not is_reverse_alias("reply+abcd@test.org")

@@ -12,6 +12,7 @@ from app.extensions import limiter
 from app.log import LOG
 from app.models import (
     Alias,
+    AliasDeleteReason,
     AliasGeneratorEnum,
     User,
     EmailLog,
@@ -70,7 +71,10 @@ def index():
 
     page = 0
     if request.args.get("page"):
-        page = int(request.args.get("page"))
+        try:
+            page = int(request.args.get("page"))
+        except ValueError:
+            pass
 
     highlight_alias_id = None
     if request.args.get("highlight_alias_id"):
@@ -143,10 +147,14 @@ def index():
             if request.form.get("form-name") == "delete-alias":
                 LOG.i(f"User {current_user} requested deletion of alias {alias}")
                 email = alias.email
-                alias_utils.delete_alias(alias, current_user)
+                alias_utils.delete_alias(
+                    alias, current_user, AliasDeleteReason.ManualAction, commit=True
+                )
                 flash(f"Alias {email} has been deleted", "success")
             elif request.form.get("form-name") == "disable-alias":
-                alias_utils.change_alias_status(alias, enabled=False)
+                alias_utils.change_alias_status(
+                    alias, enabled=False, message="Set enabled=False from dashboard"
+                )
                 Session.commit()
                 flash(f"Alias {alias.email} has been disabled", "success")
 

@@ -1,12 +1,14 @@
 import csv
 from io import StringIO
 import re
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from email_validator import validate_email, EmailNotValidError
 from sqlalchemy.exc import IntegrityError, DataError
 from flask import make_response
 
+from app.alias_audit_log_utils import AliasAuditLogAction, emit_alias_audit_log
 from app.config import (
     BOUNCE_PREFIX_FOR_REPLY_PHASE,
     BOUNCE_PREFIX,
@@ -23,6 +25,7 @@ from app.email_utils import (
     send_cannot_create_domain_alias,
     send_email,
     render,
+    sl_formataddr,
 )
 from app.errors import AliasInTrashError
 from app.events.event_dispatcher import EventDispatcher
@@ -30,10 +33,12 @@ from app.events.generated.event_pb2 import (
     AliasDeleted,
     AliasStatusChanged,
     EventContent,
+    AliasCreated,
 )
 from app.log import LOG
 from app.models import (
     Alias,
+    AliasDeleteReason,
     CustomDomain,
     Directory,
     User,
@@ -62,12 +67,16 @@ def get_user_if_alias_would_auto_create(
         # Prevent addresses with unicode characters (🤯) in them for now.
         validate_email(address, check_deliverability=False, allow_smtputf8=False)
     except EmailNotValidError:
+        LOG.i(f"Not creating alias for {address} because email is invalid")
         return None
 
     domain_and_rule = check_if_alias_can_be_auto_created_for_custom_domain(
         address, notify_user=notify_user
     )
     if DomainDeletedAlias.get_by(email=address):
+        LOG.i(
+            f"Not creating alias for {address} because it was previously deleted for this domain"
+        )
         return None
     if domain_and_rule:
         return domain_and_rule[0].user
@@ -92,6 +101,9 @@ def check_if_alias_can_be_auto_created_for_custom_domain(
     custom_domain: CustomDomain = CustomDomain.get_by(domain=alias_domain)
 
     if not custom_domain:
+        LOG.i(
+            f"Cannot auto-create custom domain alias for {address} because there's no custom domain for {alias_domain}"
+        )
         return None
 
     user: User = custom_domain.user
@@ -107,6 +119,9 @@ def check_if_alias_can_be_auto_created_for_custom_domain(
 
     if not custom_domain.catch_all:
         if len(custom_domain.auto_create_rules) == 0:
+            LOG.i(
+                f"Cannot create alias {address} for domain {custom_domain} because it has no catch-all and no rules"
+            )
             return None
         local = get_email_local_part(address)
 
@@ -120,7 +135,7 @@ def check_if_alias_can_be_auto_created_for_custom_domain(
                 )
                 return custom_domain, rule
         else:  # no rule passes
-            LOG.d("no rule passed to create %s", local)
+            LOG.d(f"No rule matches auto-create {address} for domain {custom_domain}")
             return None
     LOG.d("Create alias via catchall")
 
@@ -147,6 +162,7 @@ def check_if_alias_can_be_auto_created_for_a_directory(
         sep = "#"
     else:
         # if there's no directory separator in the alias, no way to auto-create it
+        LOG.info(f"Cannot auto-create {address} since it has no directory separator")
         return None
 
     directory_name = address[: address.find(sep)]
@@ -154,6 +170,9 @@ def check_if_alias_can_be_auto_created_for_a_directory(
 
     directory = Directory.get_by(name=directory_name)
     if not directory:
+        LOG.info(
+            f"Cannot auto-create {address} because there is no directory for {directory_name}"
+        )
         return None
 
     user: User = directory.user
@@ -162,12 +181,17 @@ def check_if_alias_can_be_auto_created_for_a_directory(
         return None
 
     if not user.can_create_new_alias():
-        LOG.d(f"{user} can't create new directory alias {address}")
+        LOG.d(
+            f"{user} can't create new directory alias {address} because user cannot create aliases"
+        )
         if notify_user:
             send_cannot_create_directory_alias(user, address, directory_name)
         return None
 
     if directory.disabled:
+        LOG.d(
+            f"{user} can't create new directory alias {address} bcause directory is disabled"
+        )
         if notify_user:
             send_cannot_create_directory_alias_disabled(user, address, directory_name)
         return None
@@ -309,7 +333,12 @@ def try_auto_create_via_domain(address: str) -> Optional[Alias]:
         return None
 
 
-def delete_alias(alias: Alias, user: User):
+def delete_alias(
+    alias: Alias,
+    user: User,
+    reason: AliasDeleteReason = AliasDeleteReason.Unspecified,
+    commit: bool = False,
+):
     """
     Delete an alias and add it to either global or domain trash
     Should be used instead of Alias.delete, DomainDeletedAlias.create, DeletedAlias.create
@@ -324,6 +353,7 @@ def delete_alias(alias: Alias, user: User):
                 user_id=user.id,
                 email=alias.email,
                 domain_id=alias.custom_domain_id,
+                reason=reason,
             )
             Session.add(domain_deleted_alias)
             Session.commit()
@@ -332,17 +362,26 @@ def delete_alias(alias: Alias, user: User):
             )
     else:
         if not DeletedAlias.get_by(email=alias.email):
-            deleted_alias = DeletedAlias(email=alias.email)
+            deleted_alias = DeletedAlias(email=alias.email, reason=reason)
             Session.add(deleted_alias)
             Session.commit()
             LOG.i(f"Moving {alias} to global trash {deleted_alias}")
 
+    alias_id = alias.id
+    alias_email = alias.email
+
+    emit_alias_audit_log(
+        alias, AliasAuditLogAction.DeleteAlias, "Alias deleted by user action"
+    )
     Alias.filter(Alias.id == alias.id).delete()
     Session.commit()
 
     EventDispatcher.send_event(
-        user, EventContent(alias_deleted=AliasDeleted(alias_id=alias.id))
+        user,
+        EventContent(alias_deleted=AliasDeleted(id=alias_id, email=alias_email)),
     )
+    if commit:
+        Session.commit()
 
 
 def aliases_for_mailbox(mailbox: Mailbox) -> [Alias]:
@@ -416,7 +455,7 @@ def alias_export_csv(user, csv_direct_export=False):
     return output
 
 
-def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
+def transfer_alias(alias: Alias, new_user: User, new_mailboxes: [Mailbox]):
     # cannot transfer alias which is used for receiving newsletter
     if User.get_by(newsletter_alias_id=alias.id):
         raise Exception("Cannot transfer alias that's used to receive newsletter")
@@ -453,10 +492,12 @@ def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
         f"Alias {alias.email} has been received",
         render(
             "transactional/alias-transferred.txt",
+            user=old_user,
             alias=alias,
         ),
         render(
             "transactional/alias-transferred.html",
+            user=old_user,
             alias=alias,
         ),
     )
@@ -468,17 +509,90 @@ def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
     alias.disable_pgp = False
     alias.pinned = False
 
+    emit_alias_audit_log(
+        alias=alias,
+        action=AliasAuditLogAction.TransferredAlias,
+        message=f"Lost ownership of alias due to alias transfer confirmed. New owner is {new_user.id}",
+        user_id=old_user.id,
+    )
+    EventDispatcher.send_event(
+        old_user,
+        EventContent(
+            alias_deleted=AliasDeleted(
+                id=alias.id,
+                email=alias.email,
+            )
+        ),
+    )
+
+    emit_alias_audit_log(
+        alias=alias,
+        action=AliasAuditLogAction.AcceptTransferAlias,
+        message=f"Accepted alias transfer from user {old_user.id}",
+        user_id=new_user.id,
+    )
+    EventDispatcher.send_event(
+        new_user,
+        EventContent(
+            alias_created=AliasCreated(
+                id=alias.id,
+                email=alias.email,
+                note=alias.note,
+                enabled=alias.enabled,
+                created_at=int(alias.created_at.timestamp),
+            )
+        ),
+    )
+
     Session.commit()
 
 
-def change_alias_status(alias: Alias, enabled: bool, commit: bool = False):
+def change_alias_status(
+    alias: Alias, enabled: bool, message: Optional[str] = None, commit: bool = False
+):
     LOG.i(f"Changing alias {alias} enabled to {enabled}")
     alias.enabled = enabled
 
     event = AliasStatusChanged(
-        alias_id=alias.id, alias_email=alias.email, enabled=enabled
+        id=alias.id,
+        email=alias.email,
+        enabled=enabled,
+        created_at=int(alias.created_at.timestamp),
     )
     EventDispatcher.send_event(alias.user, EventContent(alias_status_change=event))
+    audit_log_message = f"Set alias status to {enabled}"
+    if message is not None:
+        audit_log_message += f". {message}"
+    emit_alias_audit_log(
+        alias, AliasAuditLogAction.ChangeAliasStatus, audit_log_message
+    )
 
     if commit:
         Session.commit()
+
+
+@dataclass
+class AliasRecipientName:
+    name: str
+    message: Optional[str] = None
+
+
+def get_alias_recipient_name(alias: Alias) -> AliasRecipientName:
+    """
+    Logic:
+    1. If alias has name, use it
+    2. If alias has custom domain, and custom domain has name, use it
+    3. Otherwise, use the alias email as the recipient
+    """
+    if alias.name:
+        return AliasRecipientName(
+            name=sl_formataddr((alias.name, alias.email)),
+            message=f"Put alias name {alias.name} in from header",
+        )
+    elif alias.custom_domain:
+        if alias.custom_domain.name:
+            return AliasRecipientName(
+                name=sl_formataddr((alias.custom_domain.name, alias.email)),
+                message=f"Put domain default alias name {alias.custom_domain.name} in from header",
+            )
+    return AliasRecipientName(name=alias.email)

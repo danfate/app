@@ -1,7 +1,6 @@
 import secrets
 import string
 
-import facebook
 import google.oauth2.credentials
 import googleapiclient.discovery
 from flask import jsonify, request
@@ -23,6 +22,7 @@ from app.events.auth_event import LoginEvent, RegisterEvent
 from app.extensions import limiter
 from app.log import LOG
 from app.models import User, ApiKey, SocialAuth, AccountActivation
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 from app.utils import sanitize_email, canonicalize_email
 
 
@@ -52,8 +52,12 @@ def auth_login():
     password = data.get("password")
     device = data.get("device")
 
-    email = sanitize_email(data.get("email"))
-    canonical_email = canonicalize_email(data.get("email"))
+    email = data.get("email")
+    if not email:
+        LoginEvent(LoginEvent.ActionType.failed, LoginEvent.Source.api).send()
+        return jsonify(error="Email or password incorrect"), 400
+    email = sanitize_email(email)
+    canonical_email = canonicalize_email(email)
 
     user = User.get_by(email=email) or User.get_by(email=canonical_email)
 
@@ -129,8 +133,8 @@ def auth_register():
     send_email(
         email,
         "Just one more step to join SimpleLogin",
-        render("transactional/code-activation.txt.jinja2", code=code),
-        render("transactional/code-activation.html", code=code),
+        render("transactional/code-activation.txt.jinja2", user=user, code=code),
+        render("transactional/code-activation.html", user=user, code=code),
     )
 
     RegisterEvent(RegisterEvent.ActionType.success, RegisterEvent.Source.api).send()
@@ -183,6 +187,11 @@ def auth_activate():
 
     LOG.d("activate user %s", user)
     user.activated = True
+    emit_user_audit_log(
+        user=user,
+        action=UserAuditLogAction.ActivateUser,
+        message=f"User has been activated: {user.email}",
+    )
     AccountActivation.delete(account_activation.id)
     Session.commit()
 
@@ -226,8 +235,8 @@ def auth_reactivate():
     send_email(
         email,
         "Just one more step to join SimpleLogin",
-        render("transactional/code-activation.txt.jinja2", code=code),
-        render("transactional/code-activation.html", code=code),
+        render("transactional/code-activation.txt.jinja2", user=user, code=code),
+        render("transactional/code-activation.html", user=user, code=code),
     )
 
     return jsonify(msg="User needs to confirm their account"), 200
@@ -251,6 +260,8 @@ def auth_facebook():
         }
 
     """
+    import facebook
+
     data = request.get_json()
     if not data:
         return jsonify(error="request body cannot be empty"), 400

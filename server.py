@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from datetime import timedelta
@@ -7,10 +6,8 @@ import arrow
 import click
 import flask_limiter
 import flask_profiler
+import newrelic.agent
 import sentry_sdk
-from coinbase_commerce.error import WebhookInvalidPayload, SignatureVerificationError
-from coinbase_commerce.webhook import Webhook
-from dateutil.relativedelta import relativedelta
 from flask import (
     Flask,
     redirect,
@@ -29,7 +26,7 @@ from sentry_sdk.integrations.flask import FlaskIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from app import paddle_utils, config, paddle_callback
+from app import config, constants
 from app.admin_model import (
     SLAdminIndexView,
     UserAdmin,
@@ -45,6 +42,8 @@ from app.admin_model import (
     DailyMetricAdmin,
     MetricAdmin,
     InvalidMailboxDomainAdmin,
+    EmailSearchAdmin,
+    CustomDomainSearchAdmin,
 )
 from app.api.base import api_bp
 from app.auth.base import auth_bp
@@ -54,7 +53,6 @@ from app.config import (
     FLASK_SECRET,
     SENTRY_DSN,
     URL,
-    PADDLE_MONTHLY_PRODUCT_ID,
     FLASK_PROFILER_PATH,
     FLASK_PROFILER_PASSWORD,
     SENTRY_FRONT_END_DSN,
@@ -68,22 +66,16 @@ from app.config import (
     LANDING_PAGE_URL,
     STATUS_PAGE_URL,
     SUPPORT_EMAIL,
-    PADDLE_MONTHLY_PRODUCT_IDS,
-    PADDLE_YEARLY_PRODUCT_IDS,
     PGP_SIGNER,
-    COINBASE_WEBHOOK_SECRET,
     PAGE_LIMIT,
-    PADDLE_COUPON_ID,
     ZENDESK_ENABLED,
     MAX_NB_EMAIL_FREE_PLAN,
     MEM_STORE_URI,
 )
 from app.dashboard.base import dashboard_bp
-from app.subscription_webhook import execute_subscription_webhook
 from app.db import Session
 from app.developer.base import developer_bp
 from app.discover.base import discover_bp
-from app.email_utils import send_email, render
 from app.extensions import login_manager, limiter
 from app.fake_data import fake_data
 from app.internal.base import internal_bp
@@ -92,11 +84,8 @@ from app.log import LOG
 from app.models import (
     User,
     Alias,
-    Subscription,
-    PlanEnum,
     CustomDomain,
     Mailbox,
-    CoinbaseSubscription,
     EmailLog,
     Contact,
     ManualSubscription,
@@ -110,12 +99,16 @@ from app.models import (
     InvalidMailboxDomain,
 )
 from app.monitor.base import monitor_bp
+from app.monitor_utils import send_version_event
 from app.newsletter_utils import send_newsletter_to_user
 from app.oauth.base import oauth_bp
 from app.onboarding.base import onboarding_bp
+from app.payments.coinbase import setup_coinbase_commerce
+from app.payments.paddle import setup_paddle_callback
 from app.phone.base import phone_bp
 from app.redis_services import initialize_redis_services
-from app.utils import random_string
+from app.request_utils import generate_request_id
+from app.sentry_utils import sentry_before_send
 
 if SENTRY_DSN:
     LOG.d("enable sentry")
@@ -126,6 +119,7 @@ if SENTRY_DSN:
             FlaskIntegration(),
             SqlalchemyIntegration(),
         ],
+        before_send=sentry_before_send,
     )
 
 # the app is served behind nginx which uses http and not https
@@ -200,7 +194,7 @@ def create_app() -> Flask:
                 "username": "admin",
                 "password": FLASK_PROFILER_PASSWORD,
             },
-            "ignore": ["^/static/.*", "/git", "/exception"],
+            "ignore": ["^/static/.*", "/git", "/exception", "/health"],
         }
         flask_profiler.init_app(app)
 
@@ -217,6 +211,10 @@ def create_app() -> Flask:
     @app.teardown_appcontext
     def cleanup(resp_or_exc):
         Session.remove()
+
+    @app.route("/health", methods=["GET"])
+    def healthcheck():
+        return "success", 200
 
     return app
 
@@ -267,6 +265,7 @@ def set_index_page(app):
             and not request.path.startswith("/_debug_toolbar")
         ):
             g.start_time = time.time()
+            g.request_id = generate_request_id()
 
             # to handle the referral url that has ?slref=code part
             ref_code = request.args.get("slref")
@@ -282,7 +281,9 @@ def set_index_page(app):
             and not request.path.startswith("/_debug_toolbar")
             and not request.path.startswith("/git")
             and not request.path.startswith("/favicon.ico")
+            and not request.path.startswith("/health")
         ):
+            start_time = g.start_time or time.time()
             LOG.d(
                 "%s %s %s %s %s, takes %s",
                 request.remote_addr,
@@ -290,9 +291,12 @@ def set_index_page(app):
                 request.path,
                 request.args,
                 res.status_code,
-                time.time() - g.start_time,
+                time.time() - start_time,
             )
-
+            newrelic.agent.record_custom_event(
+                "HttpResponseStatus", {"code": res.status_code}
+            )
+            send_version_event("app")
         return res
 
 
@@ -430,332 +434,8 @@ def jinja2_filter(app):
             PAGE_LIMIT=PAGE_LIMIT,
             ZENDESK_ENABLED=ZENDESK_ENABLED,
             MAX_NB_EMAIL_FREE_PLAN=MAX_NB_EMAIL_FREE_PLAN,
+            HEADER_ALLOW_API_COOKIES=constants.HEADER_ALLOW_API_COOKIES,
         )
-
-
-def setup_paddle_callback(app: Flask):
-    @app.route("/paddle", methods=["GET", "POST"])
-    def paddle():
-        LOG.d(f"paddle callback {request.form.get('alert_name')} {request.form}")
-
-        # make sure the request comes from Paddle
-        if not paddle_utils.verify_incoming_request(dict(request.form)):
-            LOG.e("request not coming from paddle. Request data:%s", dict(request.form))
-            return "KO", 400
-
-        if (
-            request.form.get("alert_name") == "subscription_created"
-        ):  # new user subscribes
-            # the passthrough is json encoded, e.g.
-            # request.form.get("passthrough") = '{"user_id": 88 }'
-            passthrough = json.loads(request.form.get("passthrough"))
-            user_id = passthrough.get("user_id")
-            user = User.get(user_id)
-
-            subscription_plan_id = int(request.form.get("subscription_plan_id"))
-
-            if subscription_plan_id in PADDLE_MONTHLY_PRODUCT_IDS:
-                plan = PlanEnum.monthly
-            elif subscription_plan_id in PADDLE_YEARLY_PRODUCT_IDS:
-                plan = PlanEnum.yearly
-            else:
-                LOG.e(
-                    "Unknown subscription_plan_id %s %s",
-                    subscription_plan_id,
-                    request.form,
-                )
-                return "No such subscription", 400
-
-            sub = Subscription.get_by(user_id=user.id)
-
-            if not sub:
-                LOG.d(f"create a new Subscription for user {user}")
-                Subscription.create(
-                    user_id=user.id,
-                    cancel_url=request.form.get("cancel_url"),
-                    update_url=request.form.get("update_url"),
-                    subscription_id=request.form.get("subscription_id"),
-                    event_time=arrow.now(),
-                    next_bill_date=arrow.get(
-                        request.form.get("next_bill_date"), "YYYY-MM-DD"
-                    ).date(),
-                    plan=plan,
-                )
-            else:
-                LOG.d(f"Update an existing Subscription for user {user}")
-                sub.cancel_url = request.form.get("cancel_url")
-                sub.update_url = request.form.get("update_url")
-                sub.subscription_id = request.form.get("subscription_id")
-                sub.event_time = arrow.now()
-                sub.next_bill_date = arrow.get(
-                    request.form.get("next_bill_date"), "YYYY-MM-DD"
-                ).date()
-                sub.plan = plan
-
-                # make sure to set the new plan as not-cancelled
-                # in case user cancels a plan and subscribes a new plan
-                sub.cancelled = False
-
-            execute_subscription_webhook(user)
-            LOG.d("User %s upgrades!", user)
-
-            Session.commit()
-
-        elif request.form.get("alert_name") == "subscription_payment_succeeded":
-            subscription_id = request.form.get("subscription_id")
-            LOG.d("Update subscription %s", subscription_id)
-
-            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
-            # when user subscribes, the "subscription_payment_succeeded" can arrive BEFORE "subscription_created"
-            # at that time, subscription object does not exist yet
-            if sub:
-                sub.event_time = arrow.now()
-                sub.next_bill_date = arrow.get(
-                    request.form.get("next_bill_date"), "YYYY-MM-DD"
-                ).date()
-
-                Session.commit()
-                execute_subscription_webhook(sub.user)
-
-        elif request.form.get("alert_name") == "subscription_cancelled":
-            subscription_id = request.form.get("subscription_id")
-
-            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
-            if sub:
-                # cancellation_effective_date should be the same as next_bill_date
-                LOG.w(
-                    "Cancel subscription %s %s on %s, next bill date %s",
-                    subscription_id,
-                    sub.user,
-                    request.form.get("cancellation_effective_date"),
-                    sub.next_bill_date,
-                )
-                sub.event_time = arrow.now()
-
-                sub.cancelled = True
-                Session.commit()
-
-                user = sub.user
-
-                send_email(
-                    user.email,
-                    "SimpleLogin - your subscription is canceled",
-                    render(
-                        "transactional/subscription-cancel.txt",
-                        end_date=request.form.get("cancellation_effective_date"),
-                    ),
-                )
-                execute_subscription_webhook(sub.user)
-
-            else:
-                # user might have deleted their account
-                LOG.i(f"Cancel non-exist subscription {subscription_id}")
-                return "OK"
-        elif request.form.get("alert_name") == "subscription_updated":
-            subscription_id = request.form.get("subscription_id")
-
-            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
-            if sub:
-                next_bill_date = request.form.get("next_bill_date")
-                if not next_bill_date:
-                    paddle_callback.failed_payment(sub, subscription_id)
-                    return "OK"
-
-                LOG.d(
-                    "Update subscription %s %s on %s, next bill date %s",
-                    subscription_id,
-                    sub.user,
-                    request.form.get("cancellation_effective_date"),
-                    sub.next_bill_date,
-                )
-                if (
-                    int(request.form.get("subscription_plan_id"))
-                    == PADDLE_MONTHLY_PRODUCT_ID
-                ):
-                    plan = PlanEnum.monthly
-                else:
-                    plan = PlanEnum.yearly
-
-                sub.cancel_url = request.form.get("cancel_url")
-                sub.update_url = request.form.get("update_url")
-                sub.event_time = arrow.now()
-                sub.next_bill_date = arrow.get(
-                    request.form.get("next_bill_date"), "YYYY-MM-DD"
-                ).date()
-                sub.plan = plan
-
-                # make sure to set the new plan as not-cancelled
-                sub.cancelled = False
-
-                Session.commit()
-                execute_subscription_webhook(sub.user)
-            else:
-                LOG.w(
-                    f"update non-exist subscription {subscription_id}. {request.form}"
-                )
-                return "No such subscription", 400
-        elif request.form.get("alert_name") == "payment_refunded":
-            subscription_id = request.form.get("subscription_id")
-            LOG.d("Refund request for subscription %s", subscription_id)
-
-            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
-
-            if sub:
-                user = sub.user
-                Subscription.delete(sub.id)
-                Session.commit()
-                LOG.e("%s requests a refund", user)
-                execute_subscription_webhook(sub.user)
-
-        elif request.form.get("alert_name") == "subscription_payment_refunded":
-            subscription_id = request.form.get("subscription_id")
-            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
-            LOG.d(
-                "Handle subscription_payment_refunded for subscription %s",
-                subscription_id,
-            )
-
-            if not sub:
-                LOG.w(
-                    "No such subscription for %s, payload %s",
-                    subscription_id,
-                    request.form,
-                )
-                return "No such subscription"
-
-            plan_id = int(request.form["subscription_plan_id"])
-            if request.form["refund_type"] == "full":
-                if plan_id in PADDLE_MONTHLY_PRODUCT_IDS:
-                    LOG.d("subtract 1 month from next_bill_date %s", sub.next_bill_date)
-                    sub.next_bill_date = sub.next_bill_date - relativedelta(months=1)
-                    LOG.d("next_bill_date is %s", sub.next_bill_date)
-                    Session.commit()
-                elif plan_id in PADDLE_YEARLY_PRODUCT_IDS:
-                    LOG.d("subtract 1 year from next_bill_date %s", sub.next_bill_date)
-                    sub.next_bill_date = sub.next_bill_date - relativedelta(years=1)
-                    LOG.d("next_bill_date is %s", sub.next_bill_date)
-                    Session.commit()
-                else:
-                    LOG.e("Unknown plan_id %s", plan_id)
-            else:
-                LOG.w("partial subscription_payment_refunded, not handled")
-            execute_subscription_webhook(sub.user)
-
-        return "OK"
-
-    @app.route("/paddle_coupon", methods=["GET", "POST"])
-    def paddle_coupon():
-        LOG.d("paddle coupon callback %s", request.form)
-
-        if not paddle_utils.verify_incoming_request(dict(request.form)):
-            LOG.e("request not coming from paddle. Request data:%s", dict(request.form))
-            return "KO", 400
-
-        product_id = request.form.get("p_product_id")
-        if product_id != PADDLE_COUPON_ID:
-            LOG.e("product_id %s not match with %s", product_id, PADDLE_COUPON_ID)
-            return "KO", 400
-
-        email = request.form.get("email")
-        LOG.d("Paddle coupon request for %s", email)
-
-        coupon = Coupon.create(
-            code=random_string(30),
-            comment="For 1-year coupon",
-            expires_date=arrow.now().shift(years=1, days=-1),
-            commit=True,
-        )
-
-        return (
-            f"Your 1-year coupon is <b>{coupon.code}</b> <br> "
-            f"It's valid until <b>{coupon.expires_date.date().isoformat()}</b>"
-        )
-
-
-def setup_coinbase_commerce(app):
-    @app.route("/coinbase", methods=["POST"])
-    def coinbase_webhook():
-        # event payload
-        request_data = request.data.decode("utf-8")
-        # webhook signature
-        request_sig = request.headers.get("X-CC-Webhook-Signature", None)
-
-        try:
-            # signature verification and event object construction
-            event = Webhook.construct_event(
-                request_data, request_sig, COINBASE_WEBHOOK_SECRET
-            )
-        except (WebhookInvalidPayload, SignatureVerificationError) as e:
-            LOG.e("Invalid Coinbase webhook")
-            return str(e), 400
-
-        LOG.d("Coinbase event %s", event)
-
-        if event["type"] == "charge:confirmed":
-            if handle_coinbase_event(event):
-                return "success", 200
-            else:
-                return "error", 400
-
-        return "success", 200
-
-
-def handle_coinbase_event(event) -> bool:
-    user_id = int(event["data"]["metadata"]["user_id"])
-    code = event["data"]["code"]
-    user = User.get(user_id)
-    if not user:
-        LOG.e("User not found %s", user_id)
-        return False
-
-    coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
-        user_id=user_id
-    )
-
-    if not coinbase_subscription:
-        LOG.d("Create a coinbase subscription for %s", user)
-        coinbase_subscription = CoinbaseSubscription.create(
-            user_id=user_id, end_at=arrow.now().shift(years=1), code=code, commit=True
-        )
-        send_email(
-            user.email,
-            "Your SimpleLogin account has been upgraded",
-            render(
-                "transactional/coinbase/new-subscription.txt",
-                coinbase_subscription=coinbase_subscription,
-            ),
-            render(
-                "transactional/coinbase/new-subscription.html",
-                coinbase_subscription=coinbase_subscription,
-            ),
-        )
-    else:
-        if coinbase_subscription.code != code:
-            LOG.d("Update code from %s to %s", coinbase_subscription.code, code)
-            coinbase_subscription.code = code
-
-        if coinbase_subscription.is_active():
-            coinbase_subscription.end_at = coinbase_subscription.end_at.shift(years=1)
-        else:  # already expired subscription
-            coinbase_subscription.end_at = arrow.now().shift(years=1)
-
-        Session.commit()
-
-        send_email(
-            user.email,
-            "Your SimpleLogin account has been extended",
-            render(
-                "transactional/coinbase/extend-subscription.txt",
-                coinbase_subscription=coinbase_subscription,
-            ),
-            render(
-                "transactional/coinbase/extend-subscription.html",
-                coinbase_subscription=coinbase_subscription,
-            ),
-        )
-    execute_subscription_webhook(user)
-
-    return True
 
 
 def init_extensions(app: Flask):
@@ -766,6 +446,12 @@ def init_admin(app):
     admin = Admin(name="SimpleLogin", template_mode="bootstrap4")
 
     admin.init_app(app, index_view=SLAdminIndexView())
+    admin.add_view(EmailSearchAdmin(name="Email Search", endpoint="admin.email_search"))
+    admin.add_view(
+        CustomDomainSearchAdmin(
+            name="Custom domain search", endpoint="admin.custom_domain_search"
+        )
+    )
     admin.add_view(UserAdmin(User, Session))
     admin.add_view(AliasAdmin(Alias, Session))
     admin.add_view(MailboxAdmin(Mailbox, Session))
@@ -815,9 +501,9 @@ def register_custom_commands(app):
         from init_app import add_sl_domains, add_proton_partner
 
         LOG.w("reset db, add fake data")
+        add_proton_partner()
         fake_data()
         add_sl_domains()
-        add_proton_partner()
 
     @app.cli.command("send-newsletter")
     @click.option("-n", "--newsletter_id", type=int, help="Newsletter ID to be sent")
@@ -899,7 +585,8 @@ def local_main():
     # enable flask toolbar
     from flask_debugtoolbar import DebugToolbarExtension
 
-    app.config["DEBUG_TB_PROFILER_ENABLED"] = True
+    # Disabled in python 3.12 as it collides with the default CPython profiler
+    app.config["DEBUG_TB_PROFILER_ENABLED"] = False
     app.config["DEBUG_TB_INTERCEPT_REDIRECTS"] = False
     app.debug = True
     DebugToolbarExtension(app)

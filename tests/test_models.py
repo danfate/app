@@ -36,7 +36,9 @@ def test_generate_email(flask_client):
 def test_profile_picture_url(flask_client):
     user = create_new_user()
 
-    assert user.profile_picture_url() == "http://sl.test/static/default-avatar.png"
+    assert (
+        user.profile_picture_url() == f"http://{EMAIL_DOMAIN}/static/default-avatar.png"
+    )
 
 
 def test_suggested_emails_for_user_who_cannot_create_new_alias(flask_client):
@@ -303,7 +305,7 @@ def test_create_contact_for_noreply(flask_client):
     Contact.create(
         user_id=user.id,
         alias_id=alias.id,
-        website_email=f"{random.random()}@contact.test",
+        website_email=f"{random.random()}@contact.lan",
         reply_email=NOREPLY,
         commit=True,
     )
@@ -365,12 +367,22 @@ def test_sync_event_dead_letter():
         commit=True,
     )
 
+    # create event with too many retries
+    max_retries = 5
+    e5 = SyncEvent.create(
+        content=b"content",
+        retry_count=max_retries + 1,
+        created_at=arrow.now(),
+        commit=True,
+    )
+
     # get dead letter events
     dead_letter_events = SyncEvent.get_dead_letter(
-        older_than=arrow.now().shift(minutes=-10)
+        older_than=arrow.now().shift(minutes=-10), max_retries=max_retries
     )
     assert len(dead_letter_events) == 2
     assert e1 in dead_letter_events
     assert e2 in dead_letter_events
     assert e3 not in dead_letter_events
     assert e4 not in dead_letter_events
+    assert e5 not in dead_letter_events

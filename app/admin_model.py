@@ -1,18 +1,29 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import Optional, List
 
 import arrow
 import sqlalchemy
-from flask_admin.model.template import EndpointLinkRowAction
-from markupsafe import Markup
-
-from app import models, s3
 from flask import redirect, url_for, request, flash, Response
+from flask_admin import BaseView
 from flask_admin import expose, AdminIndexView
 from flask_admin.actions import action
 from flask_admin.contrib import sqla
+from flask_admin.form import SecureForm
+from flask_admin.model.template import EndpointLinkRowAction
 from flask_login import current_user
+from markupsafe import Markup
 
+from app import models, s3, config
+from app.custom_domain_validation import (
+    CustomDomainValidation,
+    DomainValidationResult,
+    ExpectedValidationRecords,
+)
 from app.db import Session
+from app.dns_utils import get_network_dns_client
+from app.events.event_dispatcher import EventDispatcher
+from app.events.generated.event_pb2 import EventContent, UserPlanChanged
 from app.models import (
     User,
     ManualSubscription,
@@ -27,8 +38,31 @@ from app.models import (
     Alias,
     Newsletter,
     PADDLE_SUBSCRIPTION_GRACE_DAYS,
+    Mailbox,
+    DeletedAlias,
+    DomainDeletedAlias,
+    PartnerUser,
+    AliasMailbox,
+    AliasAuditLog,
+    UserAuditLog,
+    CustomDomain,
 )
 from app.newsletter_utils import send_newsletter_to_user, send_newsletter_to_address
+from app.proton.proton_unlink import perform_proton_account_unlink
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
+
+
+def _admin_action_formatter(view, context, model, name):
+    action_name = AuditLogActionEnum.get_name(model.action)
+    return "{} ({})".format(action_name, model.action)
+
+
+def _admin_date_formatter(view, context, model, name):
+    return model.created_at.format()
+
+
+def _user_upgrade_channel_formatter(view, context, model, name):
+    return Markup(model.upgrade_channel)
 
 
 class SLModelView(sqla.ModelView):
@@ -92,14 +126,11 @@ class SLAdminIndexView(AdminIndexView):
         if not current_user.is_authenticated or not current_user.is_admin:
             return redirect(url_for("auth.login", next=request.url))
 
-        return redirect("/admin/user")
-
-
-def _user_upgrade_channel_formatter(view, context, model, name):
-    return Markup(model.upgrade_channel)
+        return redirect(url_for("admin.email_search.index"))
 
 
 class UserAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["email", "id"]
     column_exclude_list = [
         "salt",
@@ -118,6 +149,8 @@ class UserAdmin(SLModelView):
 
     column_formatters = {
         "upgrade_channel": _user_upgrade_channel_formatter,
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
     }
 
     @action(
@@ -329,31 +362,68 @@ def manual_upgrade(way: str, ids: [int], is_giveaway: bool):
                 manual_sub.end_at = manual_sub.end_at.shift(years=1)
             else:
                 manual_sub.end_at = arrow.now().shift(years=1, days=1)
+            emit_user_audit_log(
+                user=user,
+                action=UserAuditLogAction.Upgrade,
+                message=f"Admin {current_user.email} extended manual subscription to user {user.email}",
+            )
+            EventDispatcher.send_event(
+                user=user,
+                content=EventContent(
+                    user_plan_change=UserPlanChanged(
+                        plan_end_time=manual_sub.end_at.timestamp
+                    )
+                ),
+            )
             flash(f"Subscription extended to {manual_sub.end_at.humanize()}", "success")
-            continue
+        else:
+            emit_user_audit_log(
+                user=user,
+                action=UserAuditLogAction.Upgrade,
+                message=f"Admin {current_user.email} created manual subscription to user {user.email}",
+            )
+            manual_sub = ManualSubscription.create(
+                user_id=user.id,
+                end_at=arrow.now().shift(years=1, days=1),
+                comment=way,
+                is_giveaway=is_giveaway,
+            )
+            EventDispatcher.send_event(
+                user=user,
+                content=EventContent(
+                    user_plan_change=UserPlanChanged(
+                        plan_end_time=manual_sub.end_at.timestamp
+                    )
+                ),
+            )
 
-        ManualSubscription.create(
-            user_id=user.id,
-            end_at=arrow.now().shift(years=1, days=1),
-            comment=way,
-            is_giveaway=is_giveaway,
-        )
-
-        flash(f"New {way} manual subscription for {user} is created", "success")
+            flash(f"New {way} manual subscription for {user} is created", "success")
     Session.commit()
 
 
 class EmailLogAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id"]
     column_filters = ["id", "user.email", "mailbox.email", "contact.website_email"]
 
     can_edit = False
     can_create = False
 
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
+
 
 class AliasAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id", "user.email", "email", "mailbox.email"]
     column_filters = ["id", "user.email", "email", "mailbox.email"]
+
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
 
     @action(
         "disable_email_spoofing_check",
@@ -377,8 +447,14 @@ class AliasAdmin(SLModelView):
 
 
 class MailboxAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id", "user.email", "email"]
     column_filters = ["id", "user.email", "email"]
+
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
 
 
 # class LifetimeCouponAdmin(SLModelView):
@@ -387,13 +463,25 @@ class MailboxAdmin(SLModelView):
 
 
 class CouponAdmin(SLModelView):
+    form_base_class = SecureForm
     can_edit = False
     can_create = True
 
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
+
 
 class ManualSubscriptionAdmin(SLModelView):
+    form_base_class = SecureForm
     can_edit = True
     column_searchable_list = ["id", "user.email"]
+
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
 
     @action(
         "extend_1y",
@@ -401,14 +489,7 @@ class ManualSubscriptionAdmin(SLModelView):
         "Extend 1 year more?",
     )
     def extend_1y(self, ids):
-        for ms in ManualSubscription.filter(ManualSubscription.id.in_(ids)):
-            ms.end_at = ms.end_at.shift(years=1)
-            flash(f"Extend subscription for 1 year for {ms.user}", "success")
-            AdminAuditLog.extend_subscription(
-                current_user.id, ms.user.id, ms.end_at, "1 year"
-            )
-
-        Session.commit()
+        self.__extend_manual_subscription(ids, msg="1 year", years=1)
 
     @action(
         "extend_1m",
@@ -416,11 +497,26 @@ class ManualSubscriptionAdmin(SLModelView):
         "Extend 1 month more?",
     )
     def extend_1m(self, ids):
+        self.__extend_manual_subscription(ids, msg="1 month", months=1)
+
+    def __extend_manual_subscription(self, ids: List[int], msg: str, **kwargs):
         for ms in ManualSubscription.filter(ManualSubscription.id.in_(ids)):
-            ms.end_at = ms.end_at.shift(months=1)
-            flash(f"Extend subscription for 1 month for {ms.user}", "success")
+            sub: ManualSubscription = ms
+            sub.end_at = sub.end_at.shift(**kwargs)
+            flash(f"Extend subscription for {msg} for {sub.user}", "success")
+            emit_user_audit_log(
+                user=sub.user,
+                action=UserAuditLogAction.Upgrade,
+                message=f"Admin {current_user.email} extended manual subscription for {msg} for {sub.user}",
+            )
             AdminAuditLog.extend_subscription(
-                current_user.id, ms.user.id, ms.end_at, "1 month"
+                current_user.id, sub.user.id, sub.end_at, msg
+            )
+            EventDispatcher.send_event(
+                user=sub.user,
+                content=EventContent(
+                    user_plan_change=UserPlanChanged(plan_end_time=sub.end_at.timestamp)
+                ),
             )
 
         Session.commit()
@@ -433,14 +529,26 @@ class ManualSubscriptionAdmin(SLModelView):
 
 
 class CustomDomainAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["domain", "user.email", "user.id"]
     column_exclude_list = ["ownership_txt_token"]
     can_edit = False
 
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
+
 
 class ReferralAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id", "user.email", "code", "name"]
     column_filters = ["id", "user.email", "code", "name"]
+
+    column_formatters = {
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
+    }
 
     def scaffold_list_columns(self):
         ret = super().scaffold_list_columns()
@@ -457,16 +565,8 @@ class ReferralAdmin(SLModelView):
 #     can_delete = True
 
 
-def _admin_action_formatter(view, context, model, name):
-    action_name = AuditLogActionEnum.get_name(model.action)
-    return "{} ({})".format(action_name, model.action)
-
-
-def _admin_created_at_formatter(view, context, model, name):
-    return model.created_at.format()
-
-
 class AdminAuditLogAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["admin.id", "admin.email", "model_id", "created_at"]
     column_filters = ["admin.id", "admin.email", "model_id", "created_at"]
     column_exclude_list = ["id"]
@@ -477,7 +577,8 @@ class AdminAuditLogAdmin(SLModelView):
 
     column_formatters = {
         "action": _admin_action_formatter,
-        "created_at": _admin_created_at_formatter,
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
     }
 
 
@@ -497,6 +598,7 @@ def _transactionalcomplaint_refused_email_id_formatter(view, context, model, nam
 
 
 class ProviderComplaintAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id", "user.id", "created_at"]
     column_filters = ["user.id", "state"]
     column_hide_backrefs = False
@@ -505,8 +607,8 @@ class ProviderComplaintAdmin(SLModelView):
     can_delete = False
 
     column_formatters = {
-        "created_at": _admin_created_at_formatter,
-        "updated_at": _admin_created_at_formatter,
+        "created_at": _admin_date_formatter,
+        "updated_at": _admin_date_formatter,
         "state": _transactionalcomplaint_state_formatter,
         "phase": _transactionalcomplaint_phase_formatter,
         "refused_email": _transactionalcomplaint_refused_email_id_formatter,
@@ -567,6 +669,7 @@ def _newsletter_html_formatter(view, context, model: Newsletter, name):
 
 
 class NewsletterAdmin(SLModelView):
+    form_base_class = SecureForm
     list_template = "admin/model/newsletter-list.html"
     edit_template = "admin/model/newsletter-edit.html"
     edit_modal = False
@@ -648,6 +751,7 @@ class NewsletterAdmin(SLModelView):
 
 
 class NewsletterUserAdmin(SLModelView):
+    form_base_class = SecureForm
     column_searchable_list = ["id"]
     column_filters = ["id", "user.email", "newsletter.subject"]
     column_exclude_list = ["created_at", "updated_at", "id"]
@@ -657,17 +761,303 @@ class NewsletterUserAdmin(SLModelView):
 
 
 class DailyMetricAdmin(SLModelView):
+    form_base_class = SecureForm
     column_exclude_list = ["created_at", "updated_at", "id"]
 
     can_export = True
 
 
 class MetricAdmin(SLModelView):
+    form_base_class = SecureForm
     column_exclude_list = ["created_at", "updated_at", "id"]
 
     can_export = True
 
 
 class InvalidMailboxDomainAdmin(SLModelView):
+    form_base_class = SecureForm
     can_create = True
     can_delete = True
+
+
+class EmailSearchResult:
+    def __init__(self):
+        self.no_match: bool = True
+        self.alias: Optional[Alias] = None
+        self.alias_audit_log: Optional[List[AliasAuditLog]] = None
+        self.mailbox: List[Mailbox] = []
+        self.mailbox_count: int = 0
+        self.deleted_alias: Optional[DeletedAlias] = None
+        self.deleted_alias_audit_log: Optional[List[AliasAuditLog]] = None
+        self.domain_deleted_alias: Optional[DomainDeletedAlias] = None
+        self.domain_deleted_alias_audit_log: Optional[List[AliasAuditLog]] = None
+        self.user: Optional[User] = None
+        self.user_audit_log: Optional[List[UserAuditLog]] = None
+        self.query: str
+
+    @staticmethod
+    def from_request_email(email: str) -> EmailSearchResult:
+        output = EmailSearchResult()
+        output.query = email
+        alias = Alias.get_by(email=email)
+        if alias:
+            output.alias = alias
+            output.alias_audit_log = (
+                AliasAuditLog.filter_by(alias_id=alias.id)
+                .order_by(AliasAuditLog.created_at.desc())
+                .all()
+            )
+            output.no_match = False
+        try:
+            user_id = int(email)
+            user = User.get(user_id)
+        except ValueError:
+            user = User.get_by(email=email)
+        if user:
+            output.user = user
+            output.user_audit_log = (
+                UserAuditLog.filter_by(user_id=user.id)
+                .order_by(UserAuditLog.created_at.desc())
+                .all()
+            )
+            output.no_match = False
+
+        user_audit_log = (
+            UserAuditLog.filter_by(user_email=email)
+            .order_by(UserAuditLog.created_at.desc())
+            .all()
+        )
+        if user_audit_log:
+            output.user_audit_log = user_audit_log
+            output.no_match = False
+        mailboxes = (
+            Mailbox.filter_by(email=email).order_by(Mailbox.id.desc()).limit(10).all()
+        )
+        if mailboxes:
+            output.mailbox = mailboxes
+            output.mailbox_count = Mailbox.filter_by(email=email).count()
+            output.no_match = False
+        deleted_alias = DeletedAlias.get_by(email=email)
+        if deleted_alias:
+            output.deleted_alias = deleted_alias
+            output.deleted_alias_audit_log = (
+                AliasAuditLog.filter_by(alias_email=deleted_alias.email)
+                .order_by(AliasAuditLog.created_at.desc())
+                .all()
+            )
+            output.no_match = False
+        domain_deleted_alias = DomainDeletedAlias.get_by(email=email)
+        if domain_deleted_alias:
+            output.domain_deleted_alias = domain_deleted_alias
+            output.domain_deleted_alias_audit_log = (
+                AliasAuditLog.filter_by(alias_email=domain_deleted_alias.email)
+                .order_by(AliasAuditLog.created_at.desc())
+                .all()
+            )
+            output.no_match = False
+        return output
+
+
+class EmailSearchHelpers:
+    @staticmethod
+    def mailbox_list(user: User) -> list[Mailbox]:
+        return (
+            Mailbox.filter_by(user_id=user.id)
+            .order_by(Mailbox.id.asc())
+            .limit(10)
+            .all()
+        )
+
+    @staticmethod
+    def mailbox_count(user: User) -> int:
+        return Mailbox.filter_by(user_id=user.id).order_by(Mailbox.id.desc()).count()
+
+    @staticmethod
+    def alias_mailboxes(alias: Alias) -> list[Mailbox]:
+        return (
+            Session.query(Mailbox)
+            .filter(Mailbox.id == Alias.mailbox_id, Alias.id == alias.id)
+            .union(
+                Session.query(Mailbox)
+                .join(AliasMailbox, Mailbox.id == AliasMailbox.mailbox_id)
+                .filter(AliasMailbox.alias_id == alias.id)
+            )
+            .order_by(Mailbox.id)
+            .limit(10)
+            .all()
+        )
+
+    @staticmethod
+    def alias_mailbox_count(alias: Alias) -> int:
+        return len(alias.mailboxes)
+
+    @staticmethod
+    def alias_list(user: User) -> list[Alias]:
+        return (
+            Alias.filter_by(user_id=user.id).order_by(Alias.id.desc()).limit(10).all()
+        )
+
+    @staticmethod
+    def alias_count(user: User) -> int:
+        return Alias.filter_by(user_id=user.id).count()
+
+    @staticmethod
+    def partner_user(user: User) -> Optional[PartnerUser]:
+        return PartnerUser.get_by(user_id=user.id)
+
+
+class EmailSearchAdmin(BaseView):
+    def is_accessible(self):
+        return current_user.is_authenticated and current_user.is_admin
+
+    def inaccessible_callback(self, name, **kwargs):
+        # redirect to login page if user doesn't have access
+        flash("You don't have access to the admin page", "error")
+        return redirect(url_for("dashboard.index", next=request.url))
+
+    @expose("/", methods=["GET", "POST"])
+    def index(self):
+        search = EmailSearchResult()
+        email = request.args.get("query")
+        if email is not None and len(email) > 0:
+            email = email.strip()
+            search = EmailSearchResult.from_request_email(email)
+
+        return self.render(
+            "admin/email_search.html",
+            email=email,
+            data=search,
+            helper=EmailSearchHelpers,
+        )
+
+    @expose("/partner_unlink", methods=["POST"])
+    def delete_partner_link(self):
+        user_id = request.form.get("user_id")
+        if not user_id:
+            flash("Missing user_id", "error")
+            return redirect(url_for("admin.email_search.index"))
+        try:
+            user_id = int(user_id)
+        except ValueError:
+            flash("Missing user_id", "error")
+            return redirect(url_for("admin.email_search.index", query=user_id))
+        user = User.get(user_id)
+        if user is None:
+            flash("User not found", "error")
+            return redirect(url_for("admin.email_search.index", query=user_id))
+        external_user_id = perform_proton_account_unlink(user, skip_check=True)
+        if not external_user_id:
+            flash("User unlinked", "success")
+            return redirect(url_for("admin.email_search.index", query=user_id))
+
+        AdminAuditLog.create(
+            admin_user_id=user.id,
+            model=User.__class__.__name__,
+            model_id=user.id,
+            action=AuditLogActionEnum.unlink_user.value,
+            data={"external_user_id": external_user_id},
+        )
+        Session.commit()
+
+        return redirect(url_for("admin.email_search.index", query=user_id))
+
+
+class CustomDomainWithValidationData:
+    def __init__(self, domain: CustomDomain):
+        self.domain: CustomDomain = domain
+        self.ownership_expected: Optional[ExpectedValidationRecords] = None
+        self.ownership_validation: Optional[DomainValidationResult] = None
+        self.mx_expected: Optional[dict[int, ExpectedValidationRecords]] = None
+        self.mx_validation: Optional[DomainValidationResult] = None
+        self.spf_expected: Optional[ExpectedValidationRecords] = None
+        self.spf_validation: Optional[DomainValidationResult] = None
+        self.dkim_expected: {str: ExpectedValidationRecords} = {}
+        self.dkim_validation: {str: str} = {}
+
+
+class CustomDomainSearchResult:
+    def __init__(self):
+        self.no_match: bool = False
+        self.user: Optional[User] = None
+        self.domains: list[CustomDomainWithValidationData] = []
+
+    @staticmethod
+    def from_user(user: Optional[User]) -> CustomDomainSearchResult:
+        out = CustomDomainSearchResult()
+        if user is None:
+            out.no_match = True
+            return out
+        out.user = user
+        dns_client = get_network_dns_client()
+        validator = CustomDomainValidation(
+            dkim_domain=config.EMAIL_DOMAIN,
+            partner_domains=config.PARTNER_DNS_CUSTOM_DOMAINS,
+            partner_domains_validation_prefixes=config.PARTNER_CUSTOM_DOMAIN_VALIDATION_PREFIXES,
+            dns_client=dns_client,
+        )
+        for custom_domain in user.custom_domains:
+            validation_data = CustomDomainWithValidationData(custom_domain)
+            if not custom_domain.ownership_verified:
+                validation_data.ownership_expected = (
+                    validator.get_ownership_verification_record(custom_domain)
+                )
+                validation_data.ownership_validation = (
+                    validator.validate_domain_ownership(custom_domain)
+                )
+            if not custom_domain.verified:
+                validation_data.mx_expected = validator.get_expected_mx_records(
+                    custom_domain
+                )
+                validation_data.mx_validation = validator.validate_mx_records(
+                    custom_domain
+                )
+            if not custom_domain.spf_verified:
+                validation_data.spf_expected = validator.get_expected_spf_record(
+                    custom_domain
+                )
+                validation_data.spf_validation = validator.validate_spf_records(
+                    custom_domain
+                )
+            if not custom_domain.dkim_verified:
+                validation_data.dkim_expected = validator.get_dkim_records(
+                    custom_domain
+                )
+                validation_data.dkim_validation = validator.validate_dkim_records(
+                    custom_domain
+                )
+            out.domains.append(validation_data)
+
+        return out
+
+
+class CustomDomainSearchAdmin(BaseView):
+    def is_accessible(self):
+        return current_user.is_authenticated and current_user.is_admin
+
+    def inaccessible_callback(self, name, **kwargs):
+        # redirect to login page if user doesn't have access
+        flash("You don't have access to the admin page", "error")
+        return redirect(url_for("dashboard.index", next=request.url))
+
+    @expose("/", methods=["GET", "POST"])
+    def index(self):
+        query = request.args.get("user")
+        if query is None:
+            search = CustomDomainSearchResult()
+        else:
+            try:
+                user_id = int(query)
+                user = User.get_by(id=user_id)
+            except ValueError:
+                user = User.get_by(email=query)
+                if user is None:
+                    cd = CustomDomain.get_by(domain=query)
+                    if cd is not None:
+                        user = cd.user
+            search = CustomDomainSearchResult.from_user(user)
+
+        return self.render(
+            "admin/custom_domain_search.html",
+            data=search,
+            query=query,
+        )

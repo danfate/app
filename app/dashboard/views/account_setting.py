@@ -1,3 +1,5 @@
+import secrets
+
 import arrow
 from flask import (
     render_template,
@@ -37,7 +39,7 @@ from app.models import (
     SenderFormatEnum,
     UnsubscribeBehaviourEnum,
 )
-from app.proton.utils import perform_proton_account_unlink
+from app.proton.proton_unlink import perform_proton_account_unlink
 from app.utils import (
     random_string,
     CSRFValidationForm,
@@ -163,13 +165,13 @@ def send_reset_password_email(user):
     """
     # the activation code is valid for 1h
     reset_password_code = ResetPasswordCode.create(
-        user_id=user.id, code=random_string(60)
+        user_id=user.id, code=secrets.token_urlsafe(32)
     )
     Session.commit()
 
     reset_password_link = f"{URL}/auth/reset_password?code={reset_password_code.code}"
 
-    email_utils.send_reset_password_email(user.email, reset_password_link)
+    email_utils.send_reset_password_email(user, reset_password_link)
 
 
 def send_change_email_confirmation(user: User, email_change: EmailChange):
@@ -179,7 +181,7 @@ def send_change_email_confirmation(user: User, email_change: EmailChange):
 
     link = f"{URL}/auth/change_email?code={email_change.code}"
 
-    email_utils.send_change_email(email_change.new_email, user.email, link)
+    email_utils.send_change_email(user, email_change.new_email, link)
 
 
 @dashboard_bp.route("/resend_email_change", methods=["GET", "POST"])
@@ -237,6 +239,8 @@ def unlink_proton_account():
         flash("Invalid request", "warning")
         return redirect(url_for("dashboard.setting"))
 
-    perform_proton_account_unlink(current_user)
-    flash("Your Proton account has been unlinked", "success")
+    if not perform_proton_account_unlink(current_user):
+        flash("Account cannot be unlinked", "warning")
+    else:
+        flash("Your Proton account has been unlinked", "success")
     return redirect(url_for("dashboard.setting"))

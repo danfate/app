@@ -9,6 +9,7 @@ import pytest
 from app import config
 from app.config import MAX_ALERT_24H, ROOT_DIR
 from app.db import Session
+from app.email import headers
 from app.email_utils import (
     get_email_domain_part,
     can_create_directory_for_address,
@@ -77,23 +78,30 @@ def test_get_email_domain_part():
 
 def test_email_belongs_to_alias_domains():
     # default alias domain
-    assert can_create_directory_for_address("ab@sl.local")
-    assert not can_create_directory_for_address("ab@not-exist.local")
+    assert can_create_directory_for_address("ab@sl.lan")
+    assert not can_create_directory_for_address("ab@not-exist.lan")
 
-    assert can_create_directory_for_address("hey@d1.test")
-    assert not can_create_directory_for_address("hey@d3.test")
+    assert can_create_directory_for_address("hey@d1.lan")
+    assert not can_create_directory_for_address("hey@d3.lan")
 
 
 def test_can_be_used_as_personal_email(flask_client):
     # default alias domain
-    assert not email_can_be_used_as_mailbox("ab@sl.local")
-    assert not email_can_be_used_as_mailbox("hey@d1.test")
+    assert not email_can_be_used_as_mailbox("ab@sl.lan")
+    assert not email_can_be_used_as_mailbox("hey@d1.lan")
 
-    # custom domain
+    # custom domain as SL domain
     domain = random_domain()
     user = create_new_user()
-    CustomDomain.create(user_id=user.id, domain=domain, verified=True, commit=True)
+    domain_obj = CustomDomain.create(
+        user_id=user.id, domain=domain, verified=True, is_sl_subdomain=True, flush=True
+    )
     assert not email_can_be_used_as_mailbox(f"hey@{domain}")
+
+    # custom domain is NOT SL domain
+    domain_obj.is_sl_subdomain = False
+    Session.flush()
+    assert email_can_be_used_as_mailbox(f"hey@{domain}")
 
     # disposable domain
     disposable_domain = random_domain()
@@ -107,7 +115,7 @@ def test_can_be_used_as_personal_email(flask_client):
 
 
 def test_disabled_user_prevents_email_from_being_used_as_mailbox():
-    email = f"user_{random_token(10)}@mailbox.test"
+    email = f"user_{random_token(10)}@mailbox.lan"
     assert email_can_be_used_as_mailbox(email)
     user = create_new_user(email)
     user.disabled = True
@@ -116,7 +124,7 @@ def test_disabled_user_prevents_email_from_being_used_as_mailbox():
 
 
 def test_disabled_user_with_secondary_mailbox_prevents_email_from_being_used_as_mailbox():
-    email = f"user_{random_token(10)}@mailbox.test"
+    email = f"user_{random_token(10)}@mailbox.lan"
     assert email_can_be_used_as_mailbox(email)
     user = create_new_user()
     Mailbox.create(user_id=user.id, email=email)
@@ -354,6 +362,33 @@ def test_is_valid_email():
     assert not is_valid_email("emoji👌@gmail.com")
 
 
+def test_add_subject_prefix():
+    msg = email.message_from_string(
+        """Subject: Potato
+Content-Transfer-Encoding: 7bit
+
+hello
+"""
+    )
+    new_msg = add_header(msg, "text header", "html header", subject_prefix="[TEST]")
+    assert "text header" in new_msg.as_string()
+    assert "html header" not in new_msg.as_string()
+    assert new_msg[headers.SUBJECT] == "[TEST] Potato"
+
+
+def test_add_subject_prefix_with_no_header():
+    msg = email.message_from_string(
+        """Content-Transfer-Encoding: 7bit
+
+hello
+"""
+    )
+    new_msg = add_header(msg, "text header", "html header", subject_prefix="[TEST]")
+    assert "text header" in new_msg.as_string()
+    assert "html header" not in new_msg.as_string()
+    assert new_msg[headers.SUBJECT] == "[TEST]"
+
+
 def test_add_header_plain_text():
     msg = email.message_from_string(
         """Content-Type: text/plain; charset=us-ascii
@@ -557,8 +592,8 @@ def test_generate_reply_email_include_sender_in_reverse_alias(flask_client):
 
 
 def test_normalize_reply_email(flask_client):
-    assert normalize_reply_email("re+abcd@sl.local") == "re+abcd@sl.local"
-    assert normalize_reply_email('re+"ab cd"@sl.local') == "re+_ab_cd_@sl.local"
+    assert normalize_reply_email("re+abcd@sl.lan") == "re+abcd@sl.lan"
+    assert normalize_reply_email('re+"ab cd"@sl.lan') == "re+_ab_cd_@sl.lan"
 
 
 def test_get_encoding():
@@ -634,7 +669,7 @@ def test_should_disable(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
     for _ in range(20):
@@ -667,7 +702,7 @@ def test_should_disable_bounces_every_day(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
     for i in range(9):
@@ -695,7 +730,7 @@ def test_should_disable_bounces_account(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
 
@@ -723,7 +758,7 @@ def test_should_disable_bounce_consecutive_days(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
 
@@ -756,12 +791,21 @@ def test_parse_id_from_bounce():
     assert parse_id_from_bounce("anything+1234+@local") == 1234
 
 
-def test_get_queue_id():
+def test_get_queue_id_esmtps():
+    for id_type in ["SMTP", "ESMTP", "ESMTPA", "ESMTPS"]:
+        msg = email.message_from_string(
+            f"Received: from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.simplelogin.co (Postfix) with {id_type} id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)"
+        )
+
+        assert get_queue_id(msg) == "4FxQmw1DXdz2vK2", f"Failed for {id_type}"
+
+
+def test_get_queue_id_postfix():
     msg = email.message_from_string(
-        "Received: from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.simplelogin.co (Postfix) with ESMTPS id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)"
+        "Received: by mailin001.somewhere.net (Postfix)\r\n\tid 4Xz5pb2nMszGrqpL; Wed, 27 Nov 2024 17:21:59 +0000 (UTC)'] by mailin001.somewhere.net (Postfix)"
     )
 
-    assert get_queue_id(msg) == "4FxQmw1DXdz2vK2"
+    assert get_queue_id(msg) == "4Xz5pb2nMszGrqpL"
 
 
 def test_get_queue_id_from_double_header():

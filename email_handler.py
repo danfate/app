@@ -30,6 +30,7 @@ It should contain the following info:
 
 
 """
+
 import argparse
 import email
 import time
@@ -52,8 +53,12 @@ from flanker.addresslib import address
 from flanker.addresslib.address import EmailAddress
 from sqlalchemy.exc import IntegrityError
 
-from app import pgp_utils, s3, config
-from app.alias_utils import try_auto_create, change_alias_status
+from app import pgp_utils, s3, config, contact_utils
+from app.alias_utils import (
+    try_auto_create,
+    change_alias_status,
+    get_alias_recipient_name,
+)
 from app.config import (
     EMAIL_DOMAIN,
     URL,
@@ -145,6 +150,7 @@ from app.handler.unsubscribe_generator import UnsubscribeGenerator
 from app.handler.unsubscribe_handler import UnsubscribeHandler
 from app.log import LOG, set_message_id
 from app.mail_sender import sl_sendmail
+from app.mailbox_utils import get_mailbox_for_reply_phase
 from app.message_utils import message_to_bytes
 from app.models import (
     Alias,
@@ -162,18 +168,21 @@ from app.models import (
     VerpType,
     SLDomain,
 )
+from app.monitor_utils import send_version_event
 from app.pgp_utils import (
     PGPException,
     sign_data_with_pgpy,
     sign_data,
     load_public_key_and_check,
 )
-from app.utils import sanitize_email, canonicalize_email
+from app.utils import sanitize_email
 from init_app import load_pgp_public_keys
 from server import create_light_app
 
 
-def get_or_create_contact(from_header: str, mail_from: str, alias: Alias) -> Contact:
+def get_or_create_contact(
+    from_header: str, mail_from: str, alias: Alias
+) -> Optional[Contact]:
     """
     contact_from_header is the RFC 2047 format FROM header
     """
@@ -195,77 +204,18 @@ def get_or_create_contact(from_header: str, mail_from: str, alias: Alias) -> Con
                 mail_from,
             )
             contact_email = mail_from
-
-    if not is_valid_email(contact_email):
-        LOG.w(
-            "invalid contact email %s. Parse from %s %s",
-            contact_email,
-            from_header,
-            mail_from,
-        )
-        # either reuse a contact with empty email or create a new contact with empty email
-        contact_email = ""
-
-    contact_email = sanitize_email(contact_email, not_lower=True)
-
-    if contact_name and "\x00" in contact_name:
-        LOG.w("issue with contact name %s", contact_name)
-        contact_name = ""
-
-    contact = Contact.get_by(alias_id=alias.id, website_email=contact_email)
-    if contact:
-        if contact.name != contact_name:
-            LOG.d(
-                "Update contact %s name %s to %s",
-                contact,
-                contact.name,
-                contact_name,
-            )
-            contact.name = contact_name
-            Session.commit()
-
-        # contact created in the past does not have mail_from and from_header field
-        if not contact.mail_from and mail_from:
-            LOG.d(
-                "Set contact mail_from %s: %s to %s",
-                contact,
-                contact.mail_from,
-                mail_from,
-            )
-            contact.mail_from = mail_from
-            Session.commit()
-    else:
-        try:
-            contact_email_for_reply = (
-                contact_email if is_valid_email(contact_email) else ""
-            )
-            contact = Contact.create(
-                user_id=alias.user_id,
-                alias_id=alias.id,
-                website_email=contact_email,
-                name=contact_name,
-                mail_from=mail_from,
-                reply_email=generate_reply_email(contact_email_for_reply, alias),
-                automatic_created=True,
-            )
-            if not contact_email:
-                LOG.d("Create a contact with invalid email for %s", alias)
-                contact.invalid_email = True
-
-            LOG.d(
-                "create contact %s for %s, reverse alias:%s",
-                contact_email,
-                alias,
-                contact.reply_email,
-            )
-
-            Session.commit()
-        except IntegrityError:
-            LOG.w(f"Contact with email {contact_email} for alias {alias} already exist")
-            Session.rollback()
-            contact = Contact.get_by(alias_id=alias.id, website_email=contact_email)
-
-    return contact
+    contact_result = contact_utils.create_contact(
+        email=contact_email,
+        alias=alias,
+        name=contact_name,
+        mail_from=mail_from,
+        allow_empty_email=True,
+        automatic_created=True,
+        from_partner=False,
+    )
+    if contact_result.error:
+        LOG.w(f"Error creating contact: {contact_result.error.value}")
+    return contact_result.contact
 
 
 def get_or_create_reply_to_contact(
@@ -290,33 +240,7 @@ def get_or_create_reply_to_contact(
         )
         return None
 
-    contact = Contact.get_by(alias_id=alias.id, website_email=contact_address)
-    if contact:
-        return contact
-    else:
-        LOG.d(
-            "create contact %s for alias %s via reply-to header %s",
-            contact_address,
-            alias,
-            reply_to_header,
-        )
-
-        try:
-            contact = Contact.create(
-                user_id=alias.user_id,
-                alias_id=alias.id,
-                website_email=contact_address,
-                name=contact_name,
-                reply_email=generate_reply_email(contact_address, alias),
-                automatic_created=True,
-            )
-            Session.commit()
-        except IntegrityError:
-            LOG.w("Contact %s %s already exist", alias, contact_address)
-            Session.rollback()
-            contact = Contact.get_by(alias_id=alias.id, website_email=contact_address)
-
-    return contact
+    return contact_utils.create_contact(contact_address, alias, contact_name).contact
 
 
 def replace_header_when_forward(msg: Message, alias: Alias, header: str):
@@ -601,12 +525,14 @@ def handle_email_sent_to_ourself(alias, from_addr: str, msg: Message, user):
         f"Email sent to {alias.email} from its own mailbox {from_addr}",
         render(
             "transactional/cycle-email.txt.jinja2",
+            user=user,
             alias=alias,
             from_addr=from_addr,
             refused_email_url=refused_email_url,
         ),
         render(
             "transactional/cycle-email.html",
+            user=user,
             alias=alias,
             from_addr=from_addr,
             refused_email_url=refused_email_url,
@@ -639,7 +565,7 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
 
     if not user.is_active():
         LOG.w(f"User {user} has been soft deleted")
-        return False, status.E502
+        return [(False, status.E502)]
 
     if not user.can_send_or_receive():
         LOG.i(f"User {user} cannot receive emails")
@@ -660,16 +586,48 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
     from_header = get_header_unicode(msg[headers.FROM])
     LOG.d("Create or get contact for from_header:%s", from_header)
     contact = get_or_create_contact(from_header, envelope.mail_from, alias)
+    if not contact:
+        return [(False, status.E504)]
+    alias = (
+        contact.alias
+    )  # In case the Session was closed in the get_or_create we re-fetch the alias
 
-    reply_to_contact = None
+    reply_to_contact = []
     if msg[headers.REPLY_TO]:
-        reply_to = get_header_unicode(msg[headers.REPLY_TO])
-        LOG.d("Create or get contact for reply_to_header:%s", reply_to)
-        # ignore when reply-to = alias
-        if reply_to == alias.email:
-            LOG.i("Reply-to same as alias %s", alias)
-        else:
-            reply_to_contact = get_or_create_reply_to_contact(reply_to, alias, msg)
+        reply_to_header_contents = get_header_unicode(msg[headers.REPLY_TO])
+        if reply_to_header_contents:
+            LOG.d(
+                "Create or get contact for reply_to_header:%s", reply_to_header_contents
+            )
+            for reply_to in [
+                reply_to.strip()
+                for reply_to in reply_to_header_contents.split(",")
+                if reply_to.strip()
+            ]:
+                try:
+                    reply_to_name, reply_to_email = parse_full_address(reply_to)
+                except ValueError:
+                    LOG.d(f"Could not parse reply-to address {reply_to}")
+                    continue
+                if reply_to_email == alias.email:
+                    LOG.i("Reply-to same as alias %s", alias)
+                else:
+                    reply_contact = get_or_create_reply_to_contact(
+                        reply_to_email, alias, msg
+                    )
+                    if reply_contact:
+                        reply_to_contact.append(reply_contact)
+
+    if alias.user.delete_on is not None:
+        LOG.d(f"user {user} is pending to be deleted. Do not forward")
+        EmailLog.create(
+            contact_id=contact.id,
+            user_id=contact.user_id,
+            blocked=True,
+            alias_id=contact.alias_id,
+            commit=True,
+        )
+        return [(True, status.E502)]
 
     if not alias.enabled or contact.block_forward:
         LOG.d("%s is disabled, do not forward", alias)
@@ -728,12 +686,14 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
                     f"Your mailbox {mailbox.email} is an alias",
                     render(
                         "transactional/mailbox-invalid.txt.jinja2",
+                        user=mailbox.user,
                         mailbox=mailbox,
                         mailbox_url=mailbox_url,
                         alias=alias,
                     ),
                     render(
                         "transactional/mailbox-invalid.html",
+                        user=mailbox.user,
                         mailbox=mailbox,
                         mailbox_url=mailbox_url,
                         alias=alias,
@@ -759,7 +719,7 @@ def forward_email_to_mailbox(
     envelope,
     mailbox,
     user,
-    reply_to_contact: Optional[Contact],
+    reply_to_contacts: list[Contact],
 ) -> (bool, str):
     LOG.d("Forward %s -> %s -> %s", contact, alias, mailbox)
 
@@ -786,12 +746,14 @@ def forward_email_to_mailbox(
             f"Your mailbox {mailbox.email} and alias {alias.email} use the same domain",
             render(
                 "transactional/mailbox-invalid.txt.jinja2",
+                user=mailbox.user,
                 mailbox=mailbox,
                 mailbox_url=mailbox_url,
                 alias=alias,
             ),
             render(
                 "transactional/mailbox-invalid.html",
+                user=mailbox.user,
                 mailbox=mailbox,
                 mailbox_url=mailbox_url,
                 alias=alias,
@@ -805,7 +767,7 @@ def forward_email_to_mailbox(
 
     email_log = EmailLog.create(
         contact_id=contact.id,
-        user_id=user.id,
+        user_id=contact.user_id,
         mailbox_id=mailbox.id,
         alias_id=contact.alias_id,
         message_id=str(msg[headers.MESSAGE_ID]),
@@ -940,11 +902,13 @@ def forward_email_to_mailbox(
     add_or_replace_header(msg, "From", new_from_header)
     LOG.d("From header, new:%s, old:%s", new_from_header, old_from_header)
 
-    if reply_to_contact:
-        reply_to_header = msg[headers.REPLY_TO]
-        new_reply_to_header = reply_to_contact.new_addr()
+    if len(reply_to_contacts) > 0:
+        original_reply_to = get_header_unicode(msg[headers.REPLY_TO])
+        new_reply_to_header = ", ".join(
+            [reply_to_contact.new_addr() for reply_to_contact in reply_to_contacts][:5]
+        )
         add_or_replace_header(msg, "Reply-To", new_reply_to_header)
-        LOG.d("Reply-To header, new:%s, old:%s", new_reply_to_header, reply_to_header)
+        LOG.d("Reply-To header, new:%s, old:%s", new_reply_to_header, original_reply_to)
 
     # replace CC & To emails by reverse-alias for all emails that are not alias
     try:
@@ -1076,7 +1040,6 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         return False, status.E503
 
     user = alias.user
-    mail_from = envelope.mail_from
 
     if not user.can_send_or_receive():
         LOG.i(f"User {user} cannot send emails")
@@ -1090,13 +1053,15 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         return False, dmarc_delivery_status
 
     # Anti-spoofing
-    mailbox = get_mailbox_from_mail_from(mail_from, alias)
+    mailbox = get_mailbox_for_reply_phase(
+        envelope.mail_from, get_header_unicode(msg[headers.FROM]), alias
+    )
     if not mailbox:
         if alias.disable_email_spoofing_check:
             # ignore this error, use default alias mailbox
             LOG.w(
                 "ignore unknown sender to reverse-alias %s: %s -> %s",
-                mail_from,
+                envelope.mail_from,
                 alias,
                 contact,
             )
@@ -1239,23 +1204,11 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
 
     Session.commit()
 
-    # make the email comes from alias
-    from_header = alias.email
-    # add alias name from alias
-    if alias.name:
-        LOG.d("Put alias name %s in from header", alias.name)
-        from_header = sl_formataddr((alias.name, alias.email))
-    elif alias.custom_domain:
-        # add alias name from domain
-        if alias.custom_domain.name:
-            LOG.d(
-                "Put domain default alias name %s in from header",
-                alias.custom_domain.name,
-            )
-            from_header = sl_formataddr((alias.custom_domain.name, alias.email))
-
-    LOG.d("From header is %s", from_header)
-    add_or_replace_header(msg, headers.FROM, from_header)
+    recipient_name = get_alias_recipient_name(alias)
+    if recipient_name.message:
+        LOG.d(recipient_name.message)
+    LOG.d("From header is %s", recipient_name.name)
+    add_or_replace_header(msg, headers.FROM, recipient_name.name)
 
     try:
         if str(msg[headers.TO]).lower() == "undisclosed-recipients:;":
@@ -1276,6 +1229,7 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
             f"Email sent to {contact.email} contains non reverse-alias addresses",
             render(
                 "transactional/non-reverse-alias-reply-phase.txt.jinja2",
+                user=alias.user,
                 destination=contact.email,
                 alias=alias.email,
                 subject=msg[headers.SUBJECT],
@@ -1446,32 +1400,6 @@ def replace_original_message_id(alias: Alias, email_log: EmailLog, msg: Message)
         msg[headers.REFERENCES] = " ".join(new_message_ids)
 
 
-def get_mailbox_from_mail_from(mail_from: str, alias) -> Optional[Mailbox]:
-    """return the corresponding mailbox given the mail_from and alias
-    Usually the mail_from=mailbox.email but it can also be one of the authorized address
-    """
-
-    def __check(email_address: str, alias: Alias) -> Optional[Mailbox]:
-        for mailbox in alias.mailboxes:
-            if mailbox.email == email_address:
-                return mailbox
-
-            for authorized_address in mailbox.authorized_addresses:
-                if authorized_address.email == email_address:
-                    LOG.d(
-                        "Found an authorized address for %s %s %s",
-                        alias,
-                        mailbox,
-                        authorized_address,
-                    )
-                    return mailbox
-        return None
-
-    # We need to first check for the uncanonicalized version because we still have users in the db with the
-    # email non canonicalized. So if it matches the already existing one use that, otherwise check the canonical one
-    return __check(mail_from, alias) or __check(canonicalize_email(mail_from), alias)
-
-
 def handle_unknown_mailbox(
     envelope, msg, reply_email: str, user: User, alias: Alias, contact: Contact
 ):
@@ -1497,6 +1425,7 @@ def handle_unknown_mailbox(
         f"Attempt to use your alias {alias.email} from {envelope.mail_from}",
         render(
             "transactional/reply-must-use-personal-email.txt",
+            user=user,
             alias=alias,
             sender=envelope.mail_from,
             authorize_address_link=authorize_address_link,
@@ -1504,6 +1433,7 @@ def handle_unknown_mailbox(
         ),
         render(
             "transactional/reply-must-use-personal-email.html",
+            user=user,
             alias=alias,
             sender=envelope.mail_from,
             authorize_address_link=authorize_address_link,
@@ -1585,7 +1515,9 @@ def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
         LOG.w(
             f"Disable alias {alias} because {reason}. {alias.mailboxes} {alias.user}. Last contact {contact}"
         )
-        change_alias_status(alias, enabled=False)
+        change_alias_status(
+            alias, enabled=False, message=f"Set enabled=False due to {reason}"
+        )
 
         Notification.create(
             user_id=user.id,
@@ -1604,12 +1536,14 @@ def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
             f"Alias {alias.email} has been disabled due to multiple bounces",
             render(
                 "transactional/bounce/automatic-disable-alias.txt",
+                user=alias.user,
                 alias=alias,
                 refused_email_url=refused_email_url,
                 mailbox_email=mailbox.email,
             ),
             render(
                 "transactional/bounce/automatic-disable-alias.html",
+                user=alias.user,
                 alias=alias,
                 refused_email_url=refused_email_url,
                 mailbox_email=mailbox.email,
@@ -1648,6 +1582,7 @@ def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
             f"An email sent to {alias.email} cannot be delivered to your mailbox",
             render(
                 "transactional/bounce/bounced-email.txt.jinja2",
+                user=alias.user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -1657,6 +1592,7 @@ def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
             ),
             render(
                 "transactional/bounce/bounced-email.html",
+                user=alias.user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -1733,7 +1669,7 @@ def handle_bounce_reply_phase(envelope, msg: Message, email_log: EmailLog):
     )
     Notification.create(
         user_id=user.id,
-        title=f"Email cannot be sent to { contact.email } from your alias { alias.email }",
+        title=f"Email cannot be sent to {contact.email} from your alias {alias.email}",
         message=Notification.render(
             "notification/bounce-reply-phase.html",
             alias=alias,
@@ -1746,15 +1682,17 @@ def handle_bounce_reply_phase(envelope, msg: Message, email_log: EmailLog):
         user,
         ALERT_BOUNCE_EMAIL_REPLY_PHASE,
         mailbox.email,
-        f"Email cannot be sent to { contact.email } from your alias { alias.email }",
+        f"Email cannot be sent to {contact.email} from your alias {alias.email}",
         render(
             "transactional/bounce/bounce-email-reply-phase.txt",
+            user=user,
             alias=alias,
             contact=contact,
             refused_email_url=refused_email_url,
         ),
         render(
             "transactional/bounce/bounce-email-reply-phase.html",
+            user=user,
             alias=alias,
             contact=contact,
             refused_email_url=refused_email_url,
@@ -1817,6 +1755,7 @@ def handle_spam(
             f"Email from {alias.email} to {contact.website_email} is detected as spam",
             render(
                 "transactional/spam-email-reply-phase.txt",
+                user=user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -1824,6 +1763,7 @@ def handle_spam(
             ),
             render(
                 "transactional/spam-email-reply-phase.html",
+                user=user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -1846,6 +1786,7 @@ def handle_spam(
             f"Email from {contact.website_email} to {alias.email} is detected as spam",
             render(
                 "transactional/spam-email.txt",
+                user=user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -1853,6 +1794,7 @@ def handle_spam(
             ),
             render(
                 "transactional/spam-email.html",
+                user=user,
                 alias=alias,
                 website_email=contact.website_email,
                 disable_alias_link=disable_alias_link,
@@ -2009,7 +1951,7 @@ def send_no_reply_response(mail_from: str, msg: Message):
         ALERT_TO_NOREPLY,
         mailbox.user.email,
         "Auto: {}".format(msg[headers.SUBJECT] or "No subject"),
-        render("transactional/noreply.text.jinja2"),
+        render("transactional/noreply.text.jinja2", user=mailbox.user),
     )
 
 
@@ -2091,6 +2033,7 @@ def handle(envelope: Envelope, msg: Message) -> str:
             "SimpleLogin shouldn't be used with another email forwarding system",
             render(
                 "transactional/email-sent-from-reverse-alias.txt.jinja2",
+                user=user,
             ),
         )
 
@@ -2419,6 +2362,7 @@ class MailHandler:
             "Custom/nb_rcpt_tos", len(envelope.rcpt_tos)
         )
 
+        send_version_event("email_handler")
         with create_light_app().app_context():
             return_status = handle(envelope, msg)
             elapsed = time.time() - start
@@ -2454,6 +2398,7 @@ def main(port: int):
 
     controller.start()
     LOG.d("Start mail controller %s %s", controller.hostname, controller.port)
+    send_version_event("email_handler")
 
     if LOAD_PGP_EMAIL_HANDLER:
         LOG.w("LOAD PGP keys")

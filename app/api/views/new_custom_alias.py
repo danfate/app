@@ -1,3 +1,4 @@
+from email_validator import EmailNotValidError
 from flask import g
 from flask import jsonify, request
 
@@ -61,8 +62,17 @@ def new_custom_alias_v2():
     if not data:
         return jsonify(error="request body cannot be empty"), 400
 
-    alias_prefix = data.get("alias_prefix", "").strip().lower().replace(" ", "")
-    signed_suffix = data.get("signed_suffix", "").strip()
+    alias_prefix = data.get("alias_prefix", "")
+    if not isinstance(alias_prefix, str) or not alias_prefix:
+        return jsonify(error="invalid value for alias_prefix"), 400
+
+    alias_prefix = alias_prefix.strip().lower().replace(" ", "")
+    signed_suffix = data.get("signed_suffix", "")
+    if not isinstance(signed_suffix, str) or not signed_suffix:
+        return jsonify(error="invalid value for signed_suffix"), 400
+
+    signed_suffix = signed_suffix.strip()
+
     note = data.get("note")
     alias_prefix = convert_to_id(alias_prefix)
 
@@ -93,12 +103,15 @@ def new_custom_alias_v2():
             400,
         )
 
-    alias = Alias.create(
-        user_id=user.id,
-        email=full_alias,
-        mailbox_id=user.default_mailbox_id,
-        note=note,
-    )
+    try:
+        alias = Alias.create(
+            user_id=user.id,
+            email=full_alias,
+            mailbox_id=user.default_mailbox_id,
+            note=note,
+        )
+    except EmailNotValidError:
+        return jsonify(error="Email is not valid"), 400
 
     Session.commit()
 
@@ -153,8 +166,17 @@ def new_custom_alias_v3():
     if not isinstance(data, dict):
         return jsonify(error="request body does not follow the required format"), 400
 
-    alias_prefix = data.get("alias_prefix", "").strip().lower().replace(" ", "")
+    alias_prefix_data = data.get("alias_prefix", "") or ""
+
+    if not isinstance(alias_prefix_data, str):
+        return jsonify(error="request body does not follow the required format"), 400
+
+    alias_prefix = alias_prefix_data.strip().lower().replace(" ", "")
     signed_suffix = data.get("signed_suffix", "") or ""
+
+    if not isinstance(signed_suffix, str):
+        return jsonify(error="request body does not follow the required format"), 400
+
     signed_suffix = signed_suffix.strip()
 
     mailbox_ids = data.get("mailbox_ids")

@@ -1,8 +1,9 @@
 import arrow
-from app import config
+
+from app.constants import JobType
 from app.db import Session
 from app.models import User, Job, PartnerSubscription, PartnerUser, ManualSubscription
-from app.proton.utils import get_proton_partner
+from app.proton.proton_partner import get_proton_partner
 from tests.utils import random_email, random_token
 
 
@@ -16,7 +17,7 @@ def test_create_from_partner(flask_client):
     assert user.newsletter_alias_id is None
     job = Session.query(Job).order_by(Job.id.desc()).first()
     assert job is not None
-    assert job.name == config.JOB_SEND_PROTON_WELCOME_1
+    assert job.name == JobType.SEND_PROTON_WELCOME_1.value
     assert job.payload.get("user_id") == user.id
 
 
